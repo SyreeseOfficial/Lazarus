@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""hermes-tui — interactive TUI for Hermes Agent"""
+
+# ─── Bootstrap: create venv + install textual on first run ───────────────────
+import os, sys
+from pathlib import Path
+
+_VENV = Path.home() / ".local/share/hermes-tui/venv"
+
+try:
+    from textual.app import App  # already importable → skip bootstrap
+except ImportError:
+    import subprocess
+    if not (_VENV / "bin/python3").exists():
+        print("hermes-tui: first run — installing dependencies…", flush=True)
+        subprocess.run([sys.executable, "-m", "venv", str(_VENV)], check=True)
+        subprocess.run([str(_VENV / "bin/pip"), "install", "textual", "-q"], check=True)
+    os.execv(
+        str(_VENV / "bin/python3"),
+        [str(_VENV / "bin/python3"), str(Path(__file__).resolve())] + sys.argv[1:],
+    )
+
+# ─── Everything below runs inside the venv (textual is importable) ───────────
+
+import asyncio, re, shutil, subprocess
+from datetime import datetime
+
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.reactive import reactive
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button, Footer, Header, Input, Label,
+    ListItem, ListView, RichLog, Static,
+)
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hermes-ctl/config"
+
+SERVICE_NAME    = "hermes-gateway"
+HERMES_DIR      = Path.home() / ".hermes/hermes-agent"
+LOG_LINES       = 100
+NOTIFY          = True
+RESTORE_PROFILE = ""
+
+if _CONFIG.exists():
+    for _l in _CONFIG.read_text().splitlines():
+        if "=" in _l and not _l.startswith("#"):
+            _k, _, _v = _l.partition("=")
+            match _k.strip():
+                case "SERVICE_NAME":    SERVICE_NAME    = _v.strip()
+                case "HERMES_DIR":      HERMES_DIR      = Path(_v.strip())
+                case "LOG_LINES":       LOG_LINES       = int(_v.strip())
+                case "NOTIFY_ON_TIMER": NOTIFY          = _v.strip().lower() == "true"
+                case "RESTORE_PROFILE": RESTORE_PROFILE = _v.strip()
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _sh(*cmd: str) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+def _active() -> bool:
+    return _sh("systemctl", "--user", "is-active", SERVICE_NAME).returncode == 0
+
+def _ppd() -> bool:
+    return bool(shutil.which("powerprofilesctl"))
+
+def _fmt(s: int) -> str:
+    s = max(s, 0)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m     = s // 60
+    if d: return f"{d}d {h}h"
+    if h: return f"{h}h {m}m"
+    return f"{m}m"
+
+def _get_status() -> dict:
+    active = _active()
+    info: dict = {"active": active}
+
+    if active:
+        r = _sh("systemctl", "--user", "show", SERVICE_NAME,
+                "--property=MainPID,ActiveEnterTimestamp")
+        for line in r.stdout.splitlines():
+            k, _, v = line.partition("=")
+            info[k] = v
+        ts = info.get("ActiveEnterTimestamp", "")
+        r2 = _sh("date", "-d", ts, "+%s")
+        if r2.returncode == 0 and r2.stdout.strip().isdigit():
+            elapsed = int(datetime.now().timestamp()) - int(r2.stdout.strip())
+            info["uptime"] = _fmt(elapsed)
+
+    if _ppd():
+        info["power"] = _sh("powerprofilesctl", "get").stdout.strip()
+
+    if _sh("systemctl", "--user", "is-active", "hermes-ctl-autostop.timer").returncode == 0:
+        r = _sh("systemctl", "--user", "show", "hermes-ctl-autostop.timer",
+                "--property=NextElapseUSecRealtime")
+        v = r.stdout.strip().split("=")[-1]
+        if v.isdigit() and int(v) > 0:
+            ns  = int(v) // 1_000_000
+            rem = ns - int(datetime.now().timestamp())
+            at  = datetime.fromtimestamp(ns).strftime("%H:%M")
+            info["timer"] = f"{_fmt(rem)} (at {at})"
+
+    info["boot"]    = _sh("systemctl", "--user", "is-enabled", SERVICE_NAME).stdout.strip()
+    r = _sh("git", "-C", str(HERMES_DIR), "log", "-1", "--format=%h")
+    info["version"] = r.stdout.strip() if r.returncode == 0 else "?"
+    return info
+
+# ─── Modals ───────────────────────────────────────────────────────────────────
+
+class ConfirmModal(ModalScreen[bool]):
+    BINDINGS = [("escape", "dismiss(False)", "Cancel")]
+
+    def __init__(self, msg: str) -> None:
+        super().__init__()
+        self._msg = msg
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal-box"):
+            yield Label(self._msg, id="modal-msg")
+            with Horizontal(id="modal-btns"):
+                yield Button("Yes", variant="error",   id="yes")
+                yield Button("No",  variant="default", id="no")
+
+    def on_button_pressed(self, e: Button.Pressed) -> None:
+        self.dismiss(e.button.id == "yes")
+
+
+class TimerModal(ModalScreen):
+    BINDINGS = [("escape", "dismiss(None)", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal-box"):
+            yield Label("Set auto-stop timer",         id="modal-title")
+            yield Label("30m  ·  2h  ·  1h30m  ·  HH:MM", classes="hint")
+            yield Input(placeholder="e.g. 30m",        id="timer-input")
+            with Horizontal(id="modal-btns"):
+                yield Button("Set",    variant="primary", id="set")
+                yield Button("Cancel", variant="default", id="cancel")
+
+    def on_button_pressed(self, e: Button.Pressed) -> None:
+        v = self.query_one(Input).value.strip()
+        self.dismiss(v if e.button.id == "set" and v else None)
+
+    def on_input_submitted(self, e: Input.Submitted) -> None:
+        self.dismiss(e.value.strip() or None)
+
+# ─── Status bar ───────────────────────────────────────────────────────────────
+
+class StatusBar(Static):
+    status: reactive[dict] = reactive({})
+
+    def render(self) -> str:
+        s = self.status
+        if not s:
+            return "Loading…"
+        parts = ["● RUNNING" if s.get("active") else "○ STOPPED"]
+        if s.get("active"):
+            parts += [f"PID {s.get('MainPID', '?')}", f"Up {s.get('uptime', '?')}"]
+        if "power"   in s: parts.append(f"⚡ {s['power']}")
+        if "boot"    in s: parts.append(f"Boot: {s['boot']}")
+        if "timer"   in s: parts.append(f"⏳ {s['timer']}")
+        if "version" in s: parts.append(f"🤖 {s['version']}")
+        return "  │  ".join(parts)
+
+# ─── Menu ─────────────────────────────────────────────────────────────────────
+
+_MENU: list[tuple[str, str | None]] = [
+    ("Start",          "start"),
+    ("Stop",           "stop"),
+    ("Restart",        "restart"),
+    ("",               None),
+    ("Boot: Enable",   "boot_on"),
+    ("Boot: Disable",  "boot_off"),
+    ("",               None),
+    ("Set Timer",      "timer_set"),
+    ("Cancel Timer",   "timer_cancel"),
+    ("",               None),
+    ("Update",         "update"),
+    ("Config",         "config_show"),
+    ("",               None),
+    ("Quit",           "quit_app"),
+]
+
+# ─── App ─────────────────────────────────────────────────────────────────────
+
+_CSS = """
+StatusBar {
+    height: 1;
+    background: $panel;
+    padding: 0 1;
+}
+
+#split { height: 1fr; }
+
+#menu {
+    width: 22;
+    border-right: solid $panel-lighten-2;
+    height: 1fr;
+}
+
+ListView { height: 1fr; }
+.sep > Label { color: $text-muted; }
+
+#logs { width: 1fr; padding: 0 1; height: 1fr; }
+RichLog { height: 1fr; }
+
+ConfirmModal, TimerModal { align: center middle; }
+
+#modal-box {
+    background: $surface;
+    border: solid $primary;
+    padding: 1 2;
+    width: 54;
+    height: auto;
+}
+
+#modal-msg, #modal-title { margin-bottom: 1; }
+
+#modal-btns {
+    height: 3;
+    align: center middle;
+    margin-top: 1;
+}
+#modal-btns Button { margin: 0 1; }
+
+.hint { color: $text-muted; margin-bottom: 1; }
+#timer-input { margin-bottom: 1; }
+"""
+
+
+class HermesTUI(App):
+    CSS = _CSS
+
+    BINDINGS = [
+        Binding("q", "quit_app", "Quit"),
+        Binding("r", "refresh",  "Refresh", show=False),
+    ]
+
+    TITLE     = "Hermes Agent"
+    SUB_TITLE = SERVICE_NAME
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield StatusBar(id="statusbar")
+        with Horizontal(id="split"):
+            with Vertical(id="menu"):
+                items: list[ListItem] = []
+                for i, (label, action) in enumerate(_MENU):
+                    li = ListItem(Label("─" * 16 if not action else label), id=f"mi{i}")
+                    if not action:
+                        li.disabled = True
+                        li.add_class("sep")
+                    items.append(li)
+                yield ListView(*items)
+            with Vertical(id="logs"):
+                yield RichLog(id="log", highlight=True, markup=False, wrap=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._do_refresh()
+        self.set_interval(2, self._do_refresh)
+        self._stream_logs()
+
+    # ── Status ───────────────────────────────────────────────────────────────
+
+    @work(thread=True)
+    def _do_refresh(self) -> None:
+        s = _get_status()
+        self.call_from_thread(self._apply_status, s)
+
+    def _apply_status(self, s: dict) -> None:
+        self.query_one(StatusBar).status = s
+
+    def action_refresh(self) -> None:
+        self._do_refresh()
+
+    # ── Logs ─────────────────────────────────────────────────────────────────
+
+    @work
+    async def _stream_logs(self) -> None:
+        log = self.query_one(RichLog)
+        proc = await asyncio.create_subprocess_exec(
+            "journalctl", "--user", "-u", SERVICE_NAME,
+            f"-n{LOG_LINES}", "-f", "--no-pager",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            async for line in proc.stdout:  # type: ignore[union-attr]
+                log.write(line.decode().rstrip())
+        finally:
+            proc.terminate()
+
+    # ── Menu dispatch ─────────────────────────────────────────────────────────
+
+    def on_list_view_selected(self, e: ListView.Selected) -> None:
+        if not e.item.id:
+            return
+        idx = int(e.item.id.removeprefix("mi"))
+        _, action = _MENU[idx]
+        if action:
+            self._dispatch(action)
+
+    def _dispatch(self, action: str) -> None:
+        match action:
+            case "start":
+                if _active():
+                    self._confirm("Already running. Restart?", self._do_restart)
+                else:
+                    self._do_start()
+            case "stop":
+                self._confirm("Stop the agent?", self._do_stop)
+            case "restart":
+                self._confirm("Restart the agent?", self._do_restart)
+            case "boot_on":
+                self._confirm("Enable autostart on login?",  self._do_boot, "enable")
+            case "boot_off":
+                self._confirm("Disable autostart on login?", self._do_boot, "disable")
+            case "timer_set":
+                self.push_screen(TimerModal(), self._on_timer)
+            case "timer_cancel":
+                self._confirm("Cancel the auto-stop timer?", self._do_timer_cancel)
+            case "update":
+                self._confirm("Pull latest Hermes code?", self._do_update)
+            case "config_show":
+                self._show_config()
+            case "quit_app":
+                self.exit()
+
+    def _confirm(self, msg: str, fn, *args) -> None:
+        self.push_screen(ConfirmModal(msg), lambda ok: ok and fn(*args))
+
+    # ── Service ───────────────────────────────────────────────────────────────
+
+    @work(thread=True)
+    def _do_start(self) -> None:
+        _sh("systemctl", "--user", "start", SERVICE_NAME)
+        if _ppd():
+            _sh("powerprofilesctl", "set", "power-saver")
+        self.call_from_thread(self._do_refresh)
+
+    @work(thread=True)
+    def _do_stop(self) -> None:
+        _sh("systemctl", "--user", "stop", SERVICE_NAME)
+        if _ppd() and RESTORE_PROFILE:
+            _sh("powerprofilesctl", "set", RESTORE_PROFILE)
+        self.call_from_thread(self._do_refresh)
+
+    @work(thread=True)
+    def _do_restart(self) -> None:
+        _sh("systemctl", "--user", "restart", SERVICE_NAME)
+        if _ppd():
+            _sh("powerprofilesctl", "set", "power-saver")
+        self.call_from_thread(self._do_refresh)
+
+    @work(thread=True)
+    def _do_boot(self, sub: str) -> None:
+        _sh("systemctl", "--user", sub, SERVICE_NAME)
+        self.call_from_thread(self._do_refresh)
+
+    # ── Timer ─────────────────────────────────────────────────────────────────
+
+    def _on_timer(self, spec) -> None:
+        if spec:
+            self._do_timer_set(spec)
+
+    @work(thread=True)
+    def _do_timer_set(self, spec: str) -> None:
+        _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.timer")
+        _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.service")
+        if re.match(r"^\d{1,2}:\d{2}$", spec):
+            flag = f"--on-calendar={spec}"
+        elif re.match(r"^\d+[hm](\d+m)?$", spec):
+            flag = f"--on-active={spec}"
+        else:
+            self.call_from_thread(self._note, f"Invalid spec: {spec!r}  (use 30m, 2h, 1h30m, or HH:MM)")
+            return
+        cmd = f"systemctl --user stop {SERVICE_NAME}"
+        if NOTIFY and shutil.which("notify-send"):
+            cmd = f"notify-send 'Hermes Agent' 'Timer expired'; {cmd}"
+        _sh("systemd-run", "--user", flag, "--unit=hermes-ctl-autostop",
+            "/bin/bash", "-c", cmd)
+        self.call_from_thread(self._do_refresh)
+
+    @work(thread=True)
+    def _do_timer_cancel(self) -> None:
+        _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.timer")
+        _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.service")
+        self.call_from_thread(self._do_refresh)
+
+    # ── Update ────────────────────────────────────────────────────────────────
+
+    @work(thread=True)
+    def _do_update(self) -> None:
+        if not HERMES_DIR.is_dir():
+            self.call_from_thread(self._note, f"Not found: {HERMES_DIR}")
+            return
+        _sh("git", "-C", str(HERMES_DIR), "fetch", "-q")
+        r = _sh("git", "-C", str(HERMES_DIR), "log", "HEAD..@{u}", "--oneline")
+        if not r.stdout.strip():
+            self.call_from_thread(self._note, "Already up to date.")
+            return
+        for line in r.stdout.splitlines():
+            self.call_from_thread(self._note, line)
+        was_running = _active()
+        res = _sh("git", "-C", str(HERMES_DIR), "pull")
+        self.call_from_thread(self._note, res.stdout.strip() or "Updated.")
+        if was_running:
+            self.call_from_thread(
+                lambda: self._confirm("Restart Hermes now?", self._do_restart)
+            )
+        self.call_from_thread(self._do_refresh)
+
+    # ── Config ────────────────────────────────────────────────────────────────
+
+    def _show_config(self) -> None:
+        for line in [
+            f"Config:           {_CONFIG}",
+            f"  SERVICE_NAME    = {SERVICE_NAME}",
+            f"  HERMES_DIR      = {HERMES_DIR}",
+            f"  LOG_LINES       = {LOG_LINES}",
+            f"  NOTIFY_ON_TIMER = {NOTIFY}",
+            f"  RESTORE_PROFILE = {RESTORE_PROFILE or '<none>'}",
+        ]:
+            self._note(line)
+
+    # ── Util ──────────────────────────────────────────────────────────────────
+
+    def _note(self, msg: str) -> None:
+        self.query_one(RichLog).write(f"[hermes-tui] {msg}")
+
+    def action_quit_app(self) -> None:
+        self.exit()
+
+
+HermesTUI().run()
