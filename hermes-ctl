@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+if [[ -n "${NO_COLOR:-}" ]]; then
+    BOLD="" DIM="" RESET=""
+fi
+
+# Defaults (override in config)
+LOG_LINES=50
+RESTORE_PROFILE=""
+NOTIFY_ON_TIMER=true
+# ponytail: hermes-gateway.service already exists and runs the same ExecStart as tasks.md's
+#           hermes-agent.service — reusing it avoids a duplicate unit. Override via SERVICE_NAME in config.
+SERVICE_NAME=hermes-gateway
+HERMES_DIR="$HOME/.hermes/hermes-agent"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/hermes-ctl/config"
+
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# Helpers
+step() { printf "  ${DIM}•${RESET} %s… " "$*"; }
+ok()   { printf "${BOLD}✔${RESET}\n"; }
+die()  { printf "${BOLD}error:${RESET} %s\n" "$*" >&2; exit 1; }
+
+yn() {
+    local r
+    read -r -p "$(printf "${BOLD}%s${RESET} " "$*")" r || exit 0
+    [[ "${r,,}" == "y" ]]
+}
+
+ppd_available()    { command -v powerprofilesctl &>/dev/null; }
+notify_available() { command -v notify-send &>/dev/null; }
+is_active()        { systemctl --user is-active "$SERVICE_NAME" &>/dev/null; }
+
+format_uptime() {
+    local s=$1
+    local d=$(( s / 86400 ))
+    local h=$(( (s % 86400) / 3600 ))
+    local m=$(( (s % 3600) / 60 ))
+    if (( d > 0 )); then printf "%dd %dh" "$d" "$h"
+    elif (( h > 0 )); then printf "%dh %dm" "$h" "$m"
+    else printf "%dm" "$m"
+    fi
+}
+
+_restore_profile() {
+    if ! ppd_available; then return 0; fi
+    if [[ -n "${RESTORE_PROFILE:-}" ]]; then
+        powerprofilesctl set "$RESTORE_PROFILE"
+        return
+    fi
+    if [[ ! -t 0 ]]; then return 0; fi  # non-interactive: skip
+    local profiles=() p
+    while IFS= read -r p; do
+        profiles+=("$p")
+    done < <(powerprofilesctl list | awk '/[a-z]+:$/{gsub(/[* :]/, ""); if (NF) print}')
+    printf "\n"
+    PS3="$(printf "${BOLD}Restore profile:${RESET} ")"
+    select p in "${profiles[@]}"; do
+        [[ -n "${p:-}" ]] && break
+    done
+    powerprofilesctl set "$p"
+}
+
+_timer_cancel_existing() {
+    systemctl --user stop hermes-ctl-autostop.timer 2>/dev/null || true
+    systemctl --user stop hermes-ctl-autostop.service 2>/dev/null || true
+}
+
+cmd_help() {
+    printf "\n${BOLD}hermes-ctl${RESET}  Hermes agent manager\n\n"
+    printf "${BOLD}COMMANDS${RESET}\n"
+    printf "  start            Start agent (switches to power-saver)\n"
+    printf "  stop             Stop agent (restore power profile)\n"
+    printf "  restart          Restart agent\n"
+    printf "  status           Show status (default)\n"
+    printf "  logs             Stream logs\n"
+    printf "  boot on|off      Enable/disable autostart on login\n"
+    printf "  timer <spec>     Set auto-stop timer (e.g. 30m, 2h, 14:30)\n"
+    printf "  timer status     Show timer countdown\n"
+    printf "  timer cancel     Cancel active timer\n"
+    printf "  update           Pull latest code\n"
+    printf "  config           Show effective config\n"
+    printf "  help             Show this help\n"
+    printf "\n${BOLD}OPTIONS${RESET}\n"
+    printf "  (none yet)\n"
+    printf "\n${BOLD}EXAMPLES${RESET}\n"
+    printf "  hermes-ctl start\n"
+    printf "  hermes-ctl timer 2h30m\n"
+    printf "  hermes-ctl timer 14:30\n"
+    printf "  hermes-ctl logs\n\n"
+}
+
+cmd_start() {
+    if is_active; then
+        if yn "Already running. Restart? [y/N]"; then
+            cmd_restart
+        fi
+        return
+    fi
+    step "Starting service"; systemctl --user start "$SERVICE_NAME"; ok
+    if ppd_available; then
+        step "Switching to power-saver"; powerprofilesctl set power-saver; ok
+    fi
+}
+
+cmd_stop() {
+    if ! is_active; then
+        printf "Already stopped.\n"
+        return
+    fi
+    step "Stopping service"; systemctl --user stop "$SERVICE_NAME"; ok
+    _restore_profile
+}
+
+cmd_restart() {
+    step "Restarting"
+    systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl --user start "$SERVICE_NAME"
+    ok
+    if ppd_available; then
+        step "Switching to power-saver"; powerprofilesctl set power-saver; ok
+    fi
+}
+
+cmd_logs() {
+    journalctl --user -u "$SERVICE_NAME" -n "$LOG_LINES" -f
+}
+
+cmd_status() {
+    local pid ts start_secs uptime_str next next_secs remaining at version
+    printf "\n"
+
+    if is_active; then
+        pid=$(systemctl --user show "$SERVICE_NAME" --property=MainPID --value)
+        ts=$(systemctl --user show "$SERVICE_NAME" --property=ActiveEnterTimestamp --value)
+        start_secs=$(date -d "$ts" +%s 2>/dev/null || printf "0")
+        uptime_str=$(format_uptime $(( $(date +%s) - start_secs )))
+        printf "  ${BOLD}%-10s${RESET}  ${BOLD}● running${RESET} ${DIM}(PID %s)${RESET}\n" "Service" "$pid"
+        printf "  ${BOLD}%-10s${RESET}  ⏱   %s\n" "Uptime" "$uptime_str"
+    else
+        printf "  ${BOLD}%-10s${RESET}  ${DIM}○ stopped${RESET}\n" "Service"
+    fi
+
+    if ppd_available; then
+        printf "  ${BOLD}%-10s${RESET}  ⚡  %s\n" "Power" "$(powerprofilesctl get)"
+    else
+        printf "  ${BOLD}%-10s${RESET}  ${DIM}unavailable${RESET}\n" "Power"
+    fi
+
+    if systemctl --user is-active hermes-ctl-autostop.timer &>/dev/null; then
+        next=$(systemctl --user show hermes-ctl-autostop.timer \
+            --property=NextElapseUSecRealtime --value 2>/dev/null) || next=0
+        if (( next > 0 )); then
+            next_secs=$(( next / 1000000 ))
+            remaining=$(( next_secs - $(date +%s) ))
+            at=$(date -d "@$next_secs" +%H:%M)
+            printf "  ${BOLD}%-10s${RESET}  ⏳  stops in %s (at %s)\n" "Timer" \
+                "$(format_uptime "$remaining")" "$at"
+        fi
+    fi
+
+    version=$(git -C "$HERMES_DIR" log -1 --format='commit %h' 2>/dev/null || printf "unknown")
+    printf "  ${BOLD}%-10s${RESET}  🤖  hermes %s\n" "Version" "$version"
+    printf "\n"
+}
+
+cmd_timer() {
+    local sub="${1:-status}"
+    case "$sub" in
+        status)
+            if ! systemctl --user is-active hermes-ctl-autostop.timer &>/dev/null; then
+                printf "No timer active.\n"
+                return
+            fi
+            local next next_secs remaining at
+            next=$(systemctl --user show hermes-ctl-autostop.timer \
+                --property=NextElapseUSecRealtime --value 2>/dev/null) || next=0
+            next_secs=$(( next / 1000000 ))
+            remaining=$(( next_secs - $(date +%s) ))
+            at=$(date -d "@$next_secs" +%H:%M)
+            printf "Stops in %s (at %s)\n" "$(format_uptime "$remaining")" "$at"
+            ;;
+        cancel)
+            _timer_cancel_existing
+            printf "${BOLD}✔${RESET} Timer cancelled\n"
+            ;;
+        *)
+            local arg="$sub" flag at_str
+            _timer_cancel_existing
+            if [[ "$arg" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+                flag="--on-calendar=$arg"
+                at_str="at $arg"
+            elif [[ "$arg" =~ ^[0-9]+[hm]([0-9]+m)?$ ]]; then
+                flag="--on-active=$arg"
+                at_str="in $arg"
+            else
+                die "Invalid timer spec. Use: 30m, 2h, 1h30m, or HH:MM"
+            fi
+            local exec_cmd="hermes-ctl stop"
+            if [[ "${NOTIFY_ON_TIMER:-true}" == "true" ]] && notify_available; then
+                exec_cmd="notify-send 'Hermes Agent' 'Auto-stopped — timer expired'; hermes-ctl stop"
+            fi
+            # shellcheck disable=SC2086
+            systemd-run --user $flag --unit=hermes-ctl-autostop /bin/bash -c "$exec_cmd"
+            printf "${BOLD}✔${RESET} Timer set — stops %s\n" "$at_str"
+            ;;
+    esac
+}
+
+cmd_boot() {
+    case "${1:-}" in
+        on)
+            yn "Enable autostart on login? [y/N]" || return 0
+            systemctl --user enable "$SERVICE_NAME"
+            printf "${BOLD}✔${RESET} Autostart enabled\n"
+            ;;
+        off)
+            yn "Disable autostart on login? [y/N]" || return 0
+            systemctl --user disable "$SERVICE_NAME"
+            printf "${BOLD}✔${RESET} Autostart disabled\n"
+            ;;
+        *)
+            die "Usage: hermes-ctl boot on|off"
+            ;;
+    esac
+}
+
+cmd_update() {
+    git -C "$HERMES_DIR" rev-parse &>/dev/null || die "$HERMES_DIR is not a git repo"
+    local was_running=false
+    if is_active; then was_running=true; fi
+    step "Fetching"; git -C "$HERMES_DIR" fetch -q; ok
+    local new_commits
+    new_commits=$(git -C "$HERMES_DIR" log HEAD..@{u} --oneline 2>/dev/null) || true
+    if [[ -z "$new_commits" ]]; then
+        printf "Already up to date.\n"
+        return
+    fi
+    printf "%s\n" "$new_commits"
+    yn "Apply update? [y/N]" || return 0
+    git -C "$HERMES_DIR" pull
+    if $was_running; then
+        yn "Restart Hermes now? [y/N]" && cmd_restart || true
+    fi
+}
+
+cmd_config() {
+    printf "${BOLD}Effective config${RESET} ${DIM}(%s)${RESET}\n\n" "$CONFIG_FILE"
+    printf "  LOG_LINES=%s\n"       "$LOG_LINES"
+    printf "  RESTORE_PROFILE=%s\n" "${RESTORE_PROFILE:-<prompt on stop>}"
+    printf "  NOTIFY_ON_TIMER=%s\n" "${NOTIFY_ON_TIMER:-true}"
+    printf "  SERVICE_NAME=%s\n"    "$SERVICE_NAME"
+}
+
+command -v systemctl &>/dev/null || die "systemctl not found — hermes-ctl requires systemd"
+
+case "${1:-status}" in
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    restart)        cmd_restart ;;
+    status)         cmd_status ;;
+    logs)           cmd_logs ;;
+    boot)           shift; cmd_boot "${@}" ;;
+    timer)          shift; cmd_timer "${@}" ;;
+    update)         cmd_update ;;
+    config)         cmd_config ;;
+    help|--help|-h) cmd_help ;;
+    version)        cmd_status ;;
+    *)
+        printf "${BOLD}error:${RESET} unknown command '%s'\n" "${1:-}" >&2
+        printf "Usage: hermes-ctl <command>  (try: hermes-ctl help)\n" >&2
+        exit 1
+        ;;
+esac
