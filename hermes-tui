@@ -1,40 +1,9 @@
 #!/usr/bin/env python3
-"""hermes-tui — interactive TUI for Hermes Agent"""
+"""hermes-tui — text-based TUI for Hermes Agent"""
 
-# ─── Bootstrap: create venv + install textual on first run ───────────────────
-import os, sys
-from pathlib import Path
-
-_VENV = Path.home() / ".local/share/hermes-tui/venv"
-
-try:
-    from textual.app import App  # already importable → skip bootstrap
-except ImportError:
-    import subprocess
-    if not (_VENV / "bin/python3").exists():
-        print("hermes-tui: first run — installing dependencies…", flush=True)
-        subprocess.run([sys.executable, "-m", "venv", str(_VENV)], check=True)
-        subprocess.run([str(_VENV / "bin/pip"), "install", "textual", "-q"], check=True)
-    os.execv(
-        str(_VENV / "bin/python3"),
-        [str(_VENV / "bin/python3"), str(Path(__file__).resolve())] + sys.argv[1:],
-    )
-
-# ─── Everything below runs inside the venv (textual is importable) ───────────
-
-import asyncio, re, shutil, subprocess
+import collections, curses, os, re, shutil, subprocess, threading, time
 from datetime import datetime
-
-from textual import work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
-from textual.screen import ModalScreen
-from textual.widgets import (
-    Button, Footer, Header, Input, Label,
-    ListItem, ListView, RichLog, Static,
-)
+from pathlib import Path
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -59,28 +28,27 @@ if _CONFIG.exists():
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _sh(*cmd: str) -> subprocess.CompletedProcess:
+def _sh(*cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
-def _active() -> bool:
+def _active():
     return _sh("systemctl", "--user", "is-active", SERVICE_NAME).returncode == 0
 
-def _ppd() -> bool:
+def _ppd():
     return bool(shutil.which("powerprofilesctl"))
 
-def _fmt(s: int) -> str:
+def _fmt(s):
     s = max(s, 0)
     d, s = divmod(s, 86400)
     h, s = divmod(s, 3600)
-    m     = s // 60
+    m = s // 60
     if d: return f"{d}d {h}h"
     if h: return f"{h}h {m}m"
     return f"{m}m"
 
-def _get_status() -> dict:
+def _get_status():
     active = _active()
-    info: dict = {"active": active}
-
+    info = {"active": active}
     if active:
         r = _sh("systemctl", "--user", "show", SERVICE_NAME,
                 "--property=MainPID,ActiveEnterTimestamp")
@@ -90,288 +58,438 @@ def _get_status() -> dict:
         ts = info.get("ActiveEnterTimestamp", "")
         r2 = _sh("date", "-d", ts, "+%s")
         if r2.returncode == 0 and r2.stdout.strip().isdigit():
-            elapsed = int(datetime.now().timestamp()) - int(r2.stdout.strip())
-            info["uptime"] = _fmt(elapsed)
-
+            info["uptime"] = _fmt(int(datetime.now().timestamp()) - int(r2.stdout.strip()))
     if _ppd():
         info["power"] = _sh("powerprofilesctl", "get").stdout.strip()
-
     if _sh("systemctl", "--user", "is-active", "hermes-ctl-autostop.timer").returncode == 0:
         r = _sh("systemctl", "--user", "show", "hermes-ctl-autostop.timer",
                 "--property=NextElapseUSecRealtime")
         v = r.stdout.strip().split("=")[-1]
         if v.isdigit() and int(v) > 0:
-            ns  = int(v) // 1_000_000
+            ns = int(v) // 1_000_000
             rem = ns - int(datetime.now().timestamp())
-            at  = datetime.fromtimestamp(ns).strftime("%H:%M")
-            info["timer"] = f"{_fmt(rem)} (at {at})"
-
+            info["timer"] = f"{_fmt(rem)} (at {datetime.fromtimestamp(ns):%H:%M})"
     info["boot"]    = _sh("systemctl", "--user", "is-enabled", SERVICE_NAME).stdout.strip()
     r = _sh("git", "-C", str(HERMES_DIR), "log", "-1", "--format=%h")
     info["version"] = r.stdout.strip() if r.returncode == 0 else "?"
     return info
 
-# ─── Modals ───────────────────────────────────────────────────────────────────
-
-class ConfirmModal(ModalScreen[bool]):
-    BINDINGS = [("escape", "dismiss(False)", "Cancel")]
-
-    def __init__(self, msg: str) -> None:
-        super().__init__()
-        self._msg = msg
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="modal-box"):
-            yield Label(self._msg, id="modal-msg")
-            with Horizontal(id="modal-btns"):
-                yield Button("Yes", variant="error",   id="yes")
-                yield Button("No",  variant="default", id="no")
-
-    def on_button_pressed(self, e: Button.Pressed) -> None:
-        self.dismiss(e.button.id == "yes")
-
-
-class TimerModal(ModalScreen):
-    BINDINGS = [("escape", "dismiss(None)", "Cancel")]
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="modal-box"):
-            yield Label("Set auto-stop timer",         id="modal-title")
-            yield Label("30m  ·  2h  ·  1h30m  ·  HH:MM", classes="hint")
-            yield Input(placeholder="e.g. 30m",        id="timer-input")
-            with Horizontal(id="modal-btns"):
-                yield Button("Set",    variant="primary", id="set")
-                yield Button("Cancel", variant="default", id="cancel")
-
-    def on_button_pressed(self, e: Button.Pressed) -> None:
-        v = self.query_one(Input).value.strip()
-        self.dismiss(v if e.button.id == "set" and v else None)
-
-    def on_input_submitted(self, e: Input.Submitted) -> None:
-        self.dismiss(e.value.strip() or None)
-
-# ─── Status bar ───────────────────────────────────────────────────────────────
-
-class StatusBar(Static):
-    status: reactive[dict] = reactive({})
-
-    def render(self) -> str:
-        s = self.status
-        if not s:
-            return "Loading…"
-        parts = ["● RUNNING" if s.get("active") else "○ STOPPED"]
-        if s.get("active"):
-            parts += [f"PID {s.get('MainPID', '?')}", f"Up {s.get('uptime', '?')}"]
-        if "power"   in s: parts.append(f"⚡ {s['power']}")
-        if "boot"    in s: parts.append(f"Boot: {s['boot']}")
-        if "timer"   in s: parts.append(f"⏳ {s['timer']}")
-        if "version" in s: parts.append(f"🤖 {s['version']}")
-        return "  │  ".join(parts)
-
 # ─── Menu ─────────────────────────────────────────────────────────────────────
 
-_MENU: list[tuple[str, str | None]] = [
-    ("Start",          "start"),
-    ("Stop",           "stop"),
-    ("Restart",        "restart"),
-    ("",               None),
-    ("Boot: Enable",   "boot_on"),
-    ("Boot: Disable",  "boot_off"),
-    ("",               None),
-    ("Set Timer",      "timer_set"),
-    ("Cancel Timer",   "timer_cancel"),
-    ("",               None),
-    ("Update",         "update"),
-    ("Config",         "config_show"),
-    ("",               None),
-    ("Quit",           "quit_app"),
+_MENU = [
+    ("s", "Start"),
+    ("S", "Stop"),
+    ("r", "Restart"),
+    None,
+    ("e", "Boot: On"),
+    ("d", "Boot: Off"),
+    None,
+    ("t", "Set Timer"),
+    ("x", "Cancel Timer"),
+    None,
+    ("u", "Update"),
+    ("c", "Config"),
+    ("h", "Help"),
+    None,
+    ("q", "Quit"),
+]
+
+MENU_W = 18  # inner width of left panel (cols 1..MENU_W)
+
+# ─── Help text ────────────────────────────────────────────────────────────────
+
+_HELP = [
+    "HERMES TUI  ─  HELP",
+    "",
+    "What is Hermes?",
+    "  Hermes is an AI agent that runs silently in the background on",
+    "  your machine. This TUI lets you control it without touching",
+    "  the command line.",
+    "",
+    "─" * 58,
+    "STATUS BAR  (the line just below the title)",
+    "─" * 58,
+    "",
+    "  ● RUNNING    Hermes is active and doing its job",
+    "  ○ STOPPED    Hermes is not running",
+    "  PID          the process ID of the running agent",
+    "  Up           how long it has been running this session",
+    "  pwr:         current power profile (if powerprofilesctl installed)",
+    "  boot:        whether Hermes starts automatically when you log in",
+    "  timer:       time remaining until the auto-stop timer fires",
+    "  git:         the version (git commit) of Hermes you have installed",
+    "",
+    "─" * 58,
+    "ACTIONS",
+    "─" * 58,
+    "",
+    "  [s]  Start",
+    "       Turn Hermes on. It starts running silently in the",
+    "       background. If it is already running, nothing happens.",
+    f"       Runs: systemctl --user start {SERVICE_NAME}",
+    "",
+    "  [S]  Stop",
+    "       Turn Hermes off. The background process is stopped.",
+    f"       Runs: systemctl --user stop {SERVICE_NAME}",
+    "",
+    "  [r]  Restart",
+    "       Stop and immediately start Hermes again. Use this if",
+    "       it looks stuck, is misbehaving, or you just updated it.",
+    f"       Runs: systemctl --user restart {SERVICE_NAME}",
+    "",
+    "  [e]  Boot: On  (auto-start when you log in)",
+    "       Makes Hermes start automatically every time you log in.",
+    "       You won't need to press [s] manually each session.",
+    f"       Runs: systemctl --user enable {SERVICE_NAME}",
+    "",
+    "  [d]  Boot: Off  (no auto-start)",
+    "       Stops Hermes from launching automatically on login.",
+    "       It will stay off until you manually press [s].",
+    f"       Runs: systemctl --user disable {SERVICE_NAME}",
+    "",
+    "  [t]  Set Timer",
+    "       Schedule Hermes to stop itself after a set amount of",
+    "       time. Good for not leaving it running overnight.",
+    "       Formats you can type:",
+    "         30m       30 minutes from now",
+    "         2h        2 hours from now",
+    "         1h30m     1 hour and 30 minutes from now",
+    "         14:30     at exactly 14:30 today (24-hour clock)",
+    "       Uses systemd-run under the hood to schedule the stop.",
+    "",
+    "  [x]  Cancel Timer",
+    "       Remove the active auto-stop timer before it fires.",
+    "",
+    "  [u]  Update",
+    "       Download the latest Hermes code from its git repository",
+    "       and apply it (git pull). If Hermes was running, you'll",
+    "       be asked whether to restart it to pick up the changes.",
+    "",
+    "  [c]  Config",
+    "       Print the current configuration values to the log panel.",
+    "",
+    "─" * 58,
+    "LOG PANEL  (the right side)",
+    "─" * 58,
+    "",
+    "  Shows live output from the Hermes service — the same logs",
+    "  you would see by running this in a terminal:",
+    f"    journalctl --user -u {SERVICE_NAME} -f",
+    "  Scroll up/down with PgUp / PgDn.",
+    "",
+    "─" * 58,
+    "WHAT IS SYSTEMD?  (the thing running Hermes)",
+    "─" * 58,
+    "",
+    "  Systemd is Linux's process manager. It starts, stops, and",
+    "  monitors background tasks called 'services'.",
+    "",
+    "  Hermes runs as a systemd user service — a background process",
+    "  that Linux manages for you. This TUI is just a friendly face",
+    "  on top of standard systemctl commands.",
+    "",
+    "  Boot: On/Off tells systemd whether to launch Hermes when",
+    "  your Linux session starts. 'Enabled' means it auto-starts;",
+    "  'disabled' means you have to start it yourself.",
+    "",
 ]
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 
-_CSS = """
-StatusBar {
-    height: 1;
-    background: $panel;
-    padding: 0 1;
-}
+class App:
+    def __init__(self, scr):
+        self.scr          = scr
+        self._lock        = threading.Lock()
+        self.logs         = collections.deque(maxlen=500)
+        self.status       = {}
+        self.mode         = "normal"
+        self._cfn         = None
+        self._cmsg        = ""
+        self._ifn         = None
+        self._iprompt     = ""
+        self._ibuf        = ""
+        self._log_off     = 0
+        self._help_off    = 0
+        self._wake        = threading.Event()
 
-#split { height: 1fr; }
+    def run(self):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        if curses.has_colors():
+            curses.init_pair(1, curses.COLOR_GREEN,  -1)  # running
+            curses.init_pair(2, curses.COLOR_RED,    -1)  # stopped
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)  # keys / prompts
+            curses.init_pair(4, curses.COLOR_CYAN,   -1)  # borders
 
-#menu {
-    width: 22;
-    border-right: solid $panel-lighten-2;
-    height: 1fr;
-}
+        self.scr.keypad(True)
+        self.scr.nodelay(True)
 
-ListView { height: 1fr; }
-.sep > Label { color: $text-muted; }
+        threading.Thread(target=self._tail_logs,   daemon=True).start()
+        threading.Thread(target=self._status_loop, daemon=True).start()
 
-#logs { width: 1fr; padding: 0 1; height: 1fr; }
-RichLog { height: 1fr; }
+        while True:
+            self._draw()
+            ch = self.scr.getch()
+            if ch != -1:
+                self._handle(ch)
+            time.sleep(0.05)
 
-ConfirmModal, TimerModal { align: center middle; }
+    # ── Draw ──────────────────────────────────────────────────────────────────
 
-#modal-box {
-    background: $surface;
-    border: solid $primary;
-    padding: 1 2;
-    width: 54;
-    height: auto;
-}
-
-#modal-msg, #modal-title { margin-bottom: 1; }
-
-#modal-btns {
-    height: 3;
-    align: center middle;
-    margin-top: 1;
-}
-#modal-btns Button { margin: 0 1; }
-
-.hint { color: $text-muted; margin-bottom: 1; }
-#timer-input { margin-bottom: 1; }
-"""
-
-
-class HermesTUI(App):
-    CSS = _CSS
-
-    BINDINGS = [
-        Binding("q", "quit_app", "Quit"),
-        Binding("r", "refresh",  "Refresh", show=False),
-    ]
-
-    TITLE     = "Hermes Agent"
-    SUB_TITLE = SERVICE_NAME
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        yield StatusBar(id="statusbar")
-        with Horizontal(id="split"):
-            with Vertical(id="menu"):
-                items: list[ListItem] = []
-                for i, (label, action) in enumerate(_MENU):
-                    li = ListItem(Label("─" * 16 if not action else label), id=f"mi{i}")
-                    if not action:
-                        li.disabled = True
-                        li.add_class("sep")
-                    items.append(li)
-                yield ListView(*items)
-            with Vertical(id="logs"):
-                yield RichLog(id="log", highlight=True, markup=False, wrap=True)
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self._do_refresh()
-        self.set_interval(2, self._do_refresh)
-        self._stream_logs()
-
-    # ── Status ───────────────────────────────────────────────────────────────
-
-    @work(thread=True)
-    def _do_refresh(self) -> None:
-        s = _get_status()
-        self.call_from_thread(self._apply_status, s)
-
-    def _apply_status(self, s: dict) -> None:
-        self.query_one(StatusBar).status = s
-
-    def action_refresh(self) -> None:
-        self._do_refresh()
-
-    # ── Logs ─────────────────────────────────────────────────────────────────
-
-    @work
-    async def _stream_logs(self) -> None:
-        log = self.query_one(RichLog)
-        proc = await asyncio.create_subprocess_exec(
-            "journalctl", "--user", "-u", SERVICE_NAME,
-            f"-n{LOG_LINES}", "-f", "--no-pager",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+    def _draw(self):
         try:
-            async for line in proc.stdout:  # type: ignore[union-attr]
-                log.write(line.decode().rstrip())
-        finally:
-            proc.terminate()
+            self._draw_inner()
+        except curses.error:
+            pass
 
-    # ── Menu dispatch ─────────────────────────────────────────────────────────
+    def _draw_inner(self):
+        scr = self.scr
+        H, W = scr.getmaxyx()
+        scr.erase()
 
-    def on_list_view_selected(self, e: ListView.Selected) -> None:
-        if not e.item.id:
-            return
-        idx = int(e.item.id.removeprefix("mi"))
-        _, action = _MENU[idx]
-        if action:
-            self._dispatch(action)
+        G = curses.color_pair(1) | curses.A_BOLD  # green bold  (running)
+        R = curses.color_pair(2) | curses.A_BOLD  # red bold    (stopped)
+        Y = curses.color_pair(3) | curses.A_BOLD  # yellow bold (keys / prompts)
+        C = curses.color_pair(4)                   # cyan        (borders)
+        D = curses.A_DIM
 
-    def _dispatch(self, action: str) -> None:
-        match action:
-            case "start":
-                if _active():
-                    self._confirm("Already running. Restart?", self._do_restart)
+        # row 0 — top border + title
+        title = f" Hermes  {SERVICE_NAME} "
+        self._p(0, 0, "┌─" + title + "─" * (W - len(title) - 3) + "┐", C)
+
+        # row 1 — status
+        self._p(1, 0, "│", C)
+        self._p(1, W - 1, "│", C)
+        s = self.status
+        col = 2
+        if s:
+            if s.get("active"):
+                col = self._p(1, col, "●", G) + 1
+                col = self._p(1, col, "RUNNING", G) + 2
+                if pid := s.get("MainPID"): col = self._p(1, col, f"PID {pid}", 0) + 2
+                if up  := s.get("uptime"):  col = self._p(1, col, f"Up {up}",   0) + 2
+            else:
+                col = self._p(1, col, "○", R) + 1
+                col = self._p(1, col, "STOPPED", R) + 2
+            if pw  := s.get("power"):   col = self._p(1, col, f"pwr:{pw}",    D) + 2
+            if bt  := s.get("boot"):    col = self._p(1, col, f"boot:{bt}",   D) + 2
+            if tm  := s.get("timer"):   col = self._p(1, col, f"timer:{tm}",  Y) + 2
+            if ver := s.get("version"):      self._p(1, col, f"git:{ver}",    D)
+        else:
+            self._p(1, col, "loading...", D)
+
+        ctop = 3
+        cbot = H - 2
+
+        if self.mode == "help":
+            # full-width help screen
+            self._p(2, 0, "├" + "─" * (W - 2) + "┤", C)
+            content_h = cbot - ctop
+            visible_h = _HELP[self._help_off : self._help_off + content_h]
+            for i, line in enumerate(visible_h):
+                self._p(ctop + i, 0,     "│", C)
+                self._p(ctop + i, W - 1, "│", C)
+                self._p(ctop + i, 2, line[:W - 4], 0)
+            for row in range(ctop + len(visible_h), cbot):
+                self._p(row, 0,     "│", C)
+                self._p(row, W - 1, "│", C)
+            self._p(H - 2, 0, "├" + "─" * (W - 2) + "┤", C)
+            self._p(H - 1, 0,     "│", C)
+            self._p(H - 1, W - 1, "│", C)
+            curses.curs_set(0)
+            self._p(H - 1, 2, "PgUp/Dn:scroll  any key:close", D)
+        else:
+            # split: menu left, logs right
+            self._p(2, 0, "├" + "─" * MENU_W + "┬" + "─" * (W - MENU_W - 3) + "┤", C)
+
+            log_h = cbot - ctop
+            log_w = W - MENU_W - 4
+
+            row = ctop
+            for item in _MENU:
+                if row >= cbot:
+                    break
+                self._p(row, 0,        "│", C)
+                self._p(row, MENU_W+1, "│", C)
+                self._p(row, W-1,      "│", C)
+                if item is None:
+                    self._p(row, 1, "─" * MENU_W, D)
                 else:
-                    self._do_start()
-            case "stop":
-                self._confirm("Stop the agent?", self._do_stop)
-            case "restart":
-                self._confirm("Restart the agent?", self._do_restart)
-            case "boot_on":
-                self._confirm("Enable autostart on login?",  self._do_boot, "enable")
-            case "boot_off":
-                self._confirm("Disable autostart on login?", self._do_boot, "disable")
-            case "timer_set":
-                self.push_screen(TimerModal(), self._on_timer)
-            case "timer_cancel":
-                self._confirm("Cancel the auto-stop timer?", self._do_timer_cancel)
-            case "update":
-                self._confirm("Pull latest Hermes code?", self._do_update)
-            case "config_show":
-                self._show_config()
-            case "quit_app":
-                self.exit()
+                    key, label = item
+                    self._p(row, 2, f"[{key}]", Y)
+                    self._p(row, 6, label, 0)
+                row += 1
 
-    def _confirm(self, msg: str, fn, *args) -> None:
-        self.push_screen(ConfirmModal(msg), lambda ok: ok and fn(*args))
+            while row < cbot:
+                self._p(row, 0,        "│", C)
+                self._p(row, MENU_W+1, "│", C)
+                self._p(row, W-1,      "│", C)
+                row += 1
 
-    # ── Service ───────────────────────────────────────────────────────────────
+            with self._lock:
+                logs = list(self.logs)
+            n = len(logs)
+            if self._log_off == 0:
+                visible = logs[-log_h:]
+            else:
+                end = n - self._log_off
+                visible = logs[max(0, end - log_h):end]
+            for i, line in enumerate(visible):
+                self._p(ctop + i, MENU_W + 3, line[:log_w], D)
 
-    @work(thread=True)
-    def _do_start(self) -> None:
+            self._p(H - 2, 0, "├" + "─" * MENU_W + "┴" + "─" * (W - MENU_W - 3) + "┤", C)
+
+            self._p(H - 1, 0,     "│", C)
+            self._p(H - 1, W - 1, "│", C)
+            if self.mode == "confirm":
+                self._p(H - 1, 2, f"{self._cmsg}  [y/N]", Y)
+            elif self.mode == "input":
+                self._p(H - 1, 2, f"{self._iprompt}{self._ibuf}_", Y)
+                curses.curs_set(1)
+            else:
+                curses.curs_set(0)
+                self._p(H - 1, 2, "h:help  R:refresh  PgUp/Dn:scroll  q:quit", D)
+
+        scr.refresh()
+
+    def _p(self, row, col, text, attr=0):
+        """Write text at (row, col); return end column. Silently clips and ignores errors."""
+        H, W = self.scr.getmaxyx()
+        if row >= H or col >= W:
+            return col + len(text)
+        text = text[:W - col]
+        try:
+            self.scr.addstr(row, col, text, attr)
+        except curses.error:
+            pass
+        return col + len(text)
+
+    # ── Background threads ────────────────────────────────────────────────────
+
+    def _status_loop(self):
+        while True:
+            s = _get_status()
+            with self._lock:
+                self.status = s
+            self._wake.wait(timeout=2)
+            self._wake.clear()
+
+    def _tail_logs(self):
+        proc = subprocess.Popen(
+            ["journalctl", "--user", "-u", SERVICE_NAME,
+             f"-n{LOG_LINES}", "-f", "--no-pager", "--output=short"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        for raw in proc.stdout:
+            with self._lock:
+                self.logs.append(raw.decode().rstrip())
+
+    # ── Key dispatch ──────────────────────────────────────────────────────────
+
+    def _handle(self, ch):
+        if self.mode == "help":
+            H, _ = self.scr.getmaxyx()
+            content_h = H - 5
+            max_off = max(0, len(_HELP) - content_h)
+            if ch == curses.KEY_PPAGE:
+                self._help_off = max(0, self._help_off - content_h // 2)
+            elif ch == curses.KEY_NPAGE:
+                self._help_off = min(max_off, self._help_off + content_h // 2)
+            else:
+                self.mode = "normal"
+            return
+
+        if self.mode == "confirm":
+            if ch in (ord("y"), ord("Y")):
+                fn, args = self._cfn
+                self.mode = "normal"
+                threading.Thread(target=fn, args=args, daemon=True).start()
+            else:
+                self.mode = "normal"
+            return
+
+        if self.mode == "input":
+            if ch in (curses.KEY_ENTER, 10, 13):
+                val = self._ibuf.strip()
+                fn  = self._ifn
+                self.mode  = "normal"
+                self._ibuf = ""
+                if val and fn:
+                    threading.Thread(target=fn, args=(val,), daemon=True).start()
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self._ibuf = self._ibuf[:-1]
+            elif ch == 27:
+                self.mode  = "normal"
+                self._ibuf = ""
+            elif 32 <= ch < 127:
+                self._ibuf += chr(ch)
+            return
+
+        if ch == curses.KEY_PPAGE:
+            H, _ = self.scr.getmaxyx()
+            with self._lock:
+                n = len(self.logs)
+            self._log_off = min(self._log_off + (H - 5) // 2, max(0, n - (H - 5)))
+            return
+        if ch == curses.KEY_NPAGE:
+            H, _ = self.scr.getmaxyx()
+            self._log_off = max(0, self._log_off - (H - 5) // 2)
+            return
+
+        key = chr(ch) if 32 <= ch < 127 else None
+        match key:
+            case "q": raise SystemExit
+            case "R": self._wake.set()
+            case "s": self._confirm("Start the agent?",             self._do_start)
+            case "S": self._confirm("Stop the agent?",              self._do_stop)
+            case "r": self._confirm("Restart the agent?",           self._do_restart)
+            case "e": self._confirm("Enable autostart on login?",   self._do_boot,  "enable")
+            case "d": self._confirm("Disable autostart on login?",  self._do_boot,  "disable")
+            case "t": self._ask("Timer (30m · 2h · 1h30m · HH:MM): ", self._do_timer_set)
+            case "x": self._confirm("Cancel the auto-stop timer?",  self._do_timer_cancel)
+            case "u": self._confirm("Pull latest Hermes code?",     self._do_update)
+            case "c": self._show_config()
+            case "h": self.mode = "help"; self._help_off = 0
+
+    def _confirm(self, msg, fn, *args):
+        self._cmsg = msg
+        self._cfn  = (fn, args)
+        self.mode  = "confirm"
+
+    def _ask(self, prompt, fn):
+        self._iprompt = prompt
+        self._ifn     = fn
+        self._ibuf    = ""
+        self.mode     = "input"
+
+    def _log(self, msg):
+        with self._lock:
+            self.logs.append(f"[tui] {msg}")
+
+    # ── Service actions ───────────────────────────────────────────────────────
+
+    def _do_start(self):
         _sh("systemctl", "--user", "start", SERVICE_NAME)
-        if _ppd():
-            _sh("powerprofilesctl", "set", "power-saver")
-        self.call_from_thread(self._do_refresh)
+        if _ppd(): _sh("powerprofilesctl", "set", "power-saver")
+        self._wake.set()
 
-    @work(thread=True)
-    def _do_stop(self) -> None:
+    def _do_stop(self):
         _sh("systemctl", "--user", "stop", SERVICE_NAME)
-        if _ppd() and RESTORE_PROFILE:
-            _sh("powerprofilesctl", "set", RESTORE_PROFILE)
-        self.call_from_thread(self._do_refresh)
+        if _ppd() and RESTORE_PROFILE: _sh("powerprofilesctl", "set", RESTORE_PROFILE)
+        self._wake.set()
 
-    @work(thread=True)
-    def _do_restart(self) -> None:
+    def _do_restart(self):
         _sh("systemctl", "--user", "restart", SERVICE_NAME)
-        if _ppd():
-            _sh("powerprofilesctl", "set", "power-saver")
-        self.call_from_thread(self._do_refresh)
+        if _ppd(): _sh("powerprofilesctl", "set", "power-saver")
+        self._wake.set()
 
-    @work(thread=True)
-    def _do_boot(self, sub: str) -> None:
+    def _do_boot(self, sub):
         _sh("systemctl", "--user", sub, SERVICE_NAME)
-        self.call_from_thread(self._do_refresh)
+        self._wake.set()
 
-    # ── Timer ─────────────────────────────────────────────────────────────────
+    # ── Timer actions ─────────────────────────────────────────────────────────
 
-    def _on_timer(self, spec) -> None:
-        if spec:
-            self._do_timer_set(spec)
-
-    @work(thread=True)
-    def _do_timer_set(self, spec: str) -> None:
+    def _do_timer_set(self, spec):
         _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.timer")
         _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.service")
         if re.match(r"^\d{1,2}:\d{2}$", spec):
@@ -379,64 +497,57 @@ class HermesTUI(App):
         elif re.match(r"^\d+[hm](\d+m)?$", spec):
             flag = f"--on-active={spec}"
         else:
-            self.call_from_thread(self._note, f"Invalid spec: {spec!r}  (use 30m, 2h, 1h30m, or HH:MM)")
+            self._log(f"Invalid spec: {spec!r}  (use 30m, 2h, 1h30m, or HH:MM)")
             return
         cmd = f"systemctl --user stop {SERVICE_NAME}"
         if NOTIFY and shutil.which("notify-send"):
             cmd = f"notify-send 'Hermes Agent' 'Timer expired'; {cmd}"
         _sh("systemd-run", "--user", flag, "--unit=hermes-ctl-autostop",
             "/bin/bash", "-c", cmd)
-        self.call_from_thread(self._do_refresh)
+        self._wake.set()
 
-    @work(thread=True)
-    def _do_timer_cancel(self) -> None:
+    def _do_timer_cancel(self):
         _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.timer")
         _sh("systemctl", "--user", "stop", "hermes-ctl-autostop.service")
-        self.call_from_thread(self._do_refresh)
+        self._wake.set()
 
     # ── Update ────────────────────────────────────────────────────────────────
 
-    @work(thread=True)
-    def _do_update(self) -> None:
+    def _do_update(self):
         if not HERMES_DIR.is_dir():
-            self.call_from_thread(self._note, f"Not found: {HERMES_DIR}")
+            self._log(f"Not found: {HERMES_DIR}")
             return
         _sh("git", "-C", str(HERMES_DIR), "fetch", "-q")
         r = _sh("git", "-C", str(HERMES_DIR), "log", "HEAD..@{u}", "--oneline")
         if not r.stdout.strip():
-            self.call_from_thread(self._note, "Already up to date.")
+            self._log("Already up to date.")
             return
-        for line in r.stdout.splitlines():
-            self.call_from_thread(self._note, line)
         was_running = _active()
         res = _sh("git", "-C", str(HERMES_DIR), "pull")
-        self.call_from_thread(self._note, res.stdout.strip() or "Updated.")
+        for line in r.stdout.splitlines():
+            self._log(line)
+        self._log(res.stdout.strip() or "Updated.")
+        self._wake.set()
         if was_running:
-            self.call_from_thread(
-                lambda: self._confirm("Restart Hermes now?", self._do_restart)
-            )
-        self.call_from_thread(self._do_refresh)
+            self._confirm("Restart Hermes now?", self._do_restart)
 
     # ── Config ────────────────────────────────────────────────────────────────
 
-    def _show_config(self) -> None:
-        for line in [
-            f"Config:           {_CONFIG}",
-            f"  SERVICE_NAME    = {SERVICE_NAME}",
-            f"  HERMES_DIR      = {HERMES_DIR}",
-            f"  LOG_LINES       = {LOG_LINES}",
-            f"  NOTIFY_ON_TIMER = {NOTIFY}",
-            f"  RESTORE_PROFILE = {RESTORE_PROFILE or '<none>'}",
-        ]:
-            self._note(line)
-
-    # ── Util ──────────────────────────────────────────────────────────────────
-
-    def _note(self, msg: str) -> None:
-        self.query_one(RichLog).write(f"[hermes-tui] {msg}")
-
-    def action_quit_app(self) -> None:
-        self.exit()
+    def _show_config(self):
+        self._log(f"config file: {_CONFIG}")
+        self._log(f"  SERVICE_NAME    = {SERVICE_NAME}")
+        self._log(f"  HERMES_DIR      = {HERMES_DIR}")
+        self._log(f"  LOG_LINES       = {LOG_LINES}")
+        self._log(f"  NOTIFY_ON_TIMER = {NOTIFY}")
+        self._log(f"  RESTORE_PROFILE = {RESTORE_PROFILE or '<none>'}")
 
 
-HermesTUI().run()
+def _main(scr):
+    App(scr).run()
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(_main)
+    except SystemExit:
+        pass
